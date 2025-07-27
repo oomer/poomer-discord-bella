@@ -29,7 +29,7 @@ sudo apt install libsqlite3-dev -y
 mkdir workdir
 cd workdir
 curl -LO https://downloads.bellarender.com/bella_engine_sdk-25.3.0-linux.tar.gz
-tar -xvf  bella_engine_sdk-25.3.0.tar.gz
+tar -xvf  bella_engine_sdk-25.3.0-linux.tar.gz
 git clone https://github.com/brainboxdotcc/DPP.git
 cd DPP
 cmake -B ./build
