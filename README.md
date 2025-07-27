@@ -28,6 +28,8 @@ sudo apt install build-essential curl git cmake zlib1g-dev libssl-dev -y
 sudo apt install libsqlite3-dev -y
 mkdir workdir
 cd workdir
+curl -LO https://downloads.bellarender.com/bella_engine_sdk-25.3.0-linux.tar.gz
+tar -xvf  bella_engine_sdk-25.3.0.tar.gz
 git clone https://github.com/brainboxdotcc/DPP.git
 cd DPP
 cmake -B ./build
@@ -41,9 +43,18 @@ make all -j4
 
 ### MacOS
 
+Install Cmake to /Applications
+```
+curl -LO https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-macos-universal.dmg
+open cmake-3.31.6-macos-universal.dmg
+```
+
+
 ```
 mkdir workdir
 cd workdir
+curl -LO https://downloads.bellarender.com/bella_engine_sdk-25.3.0-macos.zip
+unzip bella_engine_sdk-25.3.0-macos.zip
 mkdir homebrew
 curl -L https://github.com/Homebrew/brew/tarball/master | tar xz --strip-components 1 -C homebrew
 eval "$(homebrew/bin/brew shellenv)"
