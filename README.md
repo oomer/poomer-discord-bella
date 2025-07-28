@@ -4,8 +4,17 @@
 
 Prototype c++ Discord bot, that renders Bella scene files (.bsz)
 - When one or more .bsz files are dropped into a channel, it will read the bsz, render and  send the jpeg back to the channel
-- Will notify @{user}  
-- listens for /help command 
+- Will notify @{user}
+
+
+<img src="resources/discord.jpg">
+
+#### Commands
+
+- Upload .bsz files - I'll automatically render them
+- `/queue` - See current render queue
+- `/history` - View recently completed renders
+- `/remove` - Cancel current rendering job (your own jobs or admin)
 
 ----
 ### Technical details
