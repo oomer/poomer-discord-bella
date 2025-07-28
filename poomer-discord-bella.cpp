@@ -15,6 +15,8 @@
 #include <vector> // Dynamic arrays - for std::vector to hold image byte data
 #include <chrono> // Time utilities - for std::chrono::seconds() delays
 #include <algorithm> // Algorithm functions - for std::transform (string case conversion)
+#include <tuple> // Tuple support - for std::tuple to hold job data with multiple fields
+#include <cstring> // C string functions - for strcmp in database migration
 #include <sqlite3.h> // SQLite3 database - for persistent work queue storage
 
 // Locale support - for fixing locale issues with Bella Engine
@@ -38,6 +40,7 @@ struct WorkItem {
     std::string original_filename;  // Original filename from Discord
     uint64_t channel_id;           // Discord channel ID for response
     uint64_t user_id;              // Discord user ID for mentions
+    std::string username;          // Discord username for display
     int64_t created_at;            // Unix timestamp when job was created
     int retry_count;               // Number of times this job has been retried
     
@@ -54,6 +57,8 @@ private:
     std::mutex queue_mutex;
     std::condition_variable queue_condition;
     std::atomic<bool> shutdown_requested{false};
+    std::atomic<bool> cancel_current_job{false};
+    std::atomic<int64_t> current_job_id{0};
     
 public:
     WorkQueue() : db(nullptr) {}
@@ -87,7 +92,10 @@ public:
                 user_id INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 retry_count INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'pending'
+                status TEXT DEFAULT 'pending',
+                bella_start_time INTEGER DEFAULT 0,
+                bella_end_time INTEGER DEFAULT 0,
+                username TEXT DEFAULT ''
             );
             
             CREATE INDEX IF NOT EXISTS idx_status_created 
@@ -103,6 +111,80 @@ public:
         }
         
         std::cout << "✅ Work queue database initialized: " << db_path << std::endl;
+        
+        // Database migration: Add missing columns if they don't exist
+        const char* check_column_sql = "PRAGMA table_info(work_queue);";
+        bool has_bella_start_time = false;
+        bool has_bella_end_time = false;
+        bool has_username = false;
+        
+        sqlite3_stmt* pragma_stmt;
+        rc = sqlite3_prepare_v2(db, check_column_sql, -1, &pragma_stmt, nullptr);
+        if (rc == SQLITE_OK) {
+            while (sqlite3_step(pragma_stmt) == SQLITE_ROW) {
+                const char* column_name = (const char*)sqlite3_column_text(pragma_stmt, 1);
+                if (column_name) {
+                    if (strcmp(column_name, "bella_start_time") == 0) {
+                        has_bella_start_time = true;
+                    } else if (strcmp(column_name, "bella_end_time") == 0) {
+                        has_bella_end_time = true;
+                    } else if (strcmp(column_name, "username") == 0) {
+                        has_username = true;
+                    }
+                }
+            }
+            sqlite3_finalize(pragma_stmt);
+        }
+        
+        if (!has_bella_start_time) {
+            std::cout << "🔄 Migrating database: Adding bella_start_time column..." << std::endl;
+            const char* add_column_sql = "ALTER TABLE work_queue ADD COLUMN bella_start_time INTEGER DEFAULT 0;";
+            rc = sqlite3_exec(db, add_column_sql, nullptr, nullptr, &error_msg);
+            if (rc != SQLITE_OK) {
+                std::cerr << "❌ Failed to add bella_start_time column: " << error_msg << std::endl;
+                sqlite3_free(error_msg);
+            } else {
+                std::cout << "✅ Database migration: bella_start_time column added" << std::endl;
+            }
+        }
+        
+        if (!has_bella_end_time) {
+            std::cout << "🔄 Migrating database: Adding bella_end_time column..." << std::endl;
+            const char* add_end_column_sql = "ALTER TABLE work_queue ADD COLUMN bella_end_time INTEGER DEFAULT 0;";
+            rc = sqlite3_exec(db, add_end_column_sql, nullptr, nullptr, &error_msg);
+            if (rc != SQLITE_OK) {
+                std::cerr << "❌ Failed to add bella_end_time column: " << error_msg << std::endl;
+                sqlite3_free(error_msg);
+            } else {
+                std::cout << "✅ Database migration: bella_end_time column added" << std::endl;
+            }
+        }
+        
+        if (!has_username) {
+            std::cout << "🔄 Migrating database: Adding username column..." << std::endl;
+            const char* add_username_column_sql = "ALTER TABLE work_queue ADD COLUMN username TEXT DEFAULT '';";
+            rc = sqlite3_exec(db, add_username_column_sql, nullptr, nullptr, &error_msg);
+            if (rc != SQLITE_OK) {
+                std::cerr << "❌ Failed to add username column: " << error_msg << std::endl;
+                sqlite3_free(error_msg);
+            } else {
+                std::cout << "✅ Database migration: username column added" << std::endl;
+            }
+        }
+        
+        // Reset any stuck 'processing' jobs back to 'pending' on startup
+        // This handles cases where the bot was stopped while jobs were being processed
+        const char* reset_processing_sql = "UPDATE work_queue SET status = 'pending' WHERE status = 'processing';";
+        rc = sqlite3_exec(db, reset_processing_sql, nullptr, nullptr, &error_msg);
+        if (rc != SQLITE_OK) {
+            std::cerr << "❌ Failed to reset stuck processing jobs: " << error_msg << std::endl;
+            sqlite3_free(error_msg);
+        } else {
+            int reset_count = sqlite3_changes(db);
+            if (reset_count > 0) {
+                std::cout << "🔄 Reset " << reset_count << " stuck processing job(s) back to pending" << std::endl;
+            }
+        }
         
         // Log any existing pending jobs on startup
         int pending_count = getPendingJobCount();
@@ -121,8 +203,8 @@ public:
         
         const char* insert_sql = R"(
             INSERT INTO work_queue 
-            (attachment_url, original_filename, channel_id, user_id, created_at, retry_count)
-            VALUES (?, ?, ?, ?, ?, ?);
+            (attachment_url, original_filename, channel_id, user_id, username, created_at, retry_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
         )";
         
         sqlite3_stmt* stmt;
@@ -137,8 +219,9 @@ public:
         sqlite3_bind_text(stmt, 2, item.original_filename.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_int64(stmt, 3, item.channel_id);
         sqlite3_bind_int64(stmt, 4, item.user_id);
-        sqlite3_bind_int64(stmt, 5, item.created_at);
-        sqlite3_bind_int(stmt, 6, item.retry_count);
+        sqlite3_bind_text(stmt, 5, item.username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 6, item.created_at);
+        sqlite3_bind_int(stmt, 7, item.retry_count);
         
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -164,7 +247,7 @@ public:
         
         while (!shutdown_requested) {
             const char* select_sql = R"(
-                SELECT id, attachment_url, original_filename, channel_id, user_id, created_at, retry_count
+                SELECT id, attachment_url, original_filename, channel_id, user_id, username, created_at, retry_count
                 FROM work_queue 
                 WHERE status = 'pending'
                 ORDER BY created_at ASC
@@ -186,8 +269,9 @@ public:
                 item.original_filename = (const char*)sqlite3_column_text(stmt, 2);
                 item.channel_id = sqlite3_column_int64(stmt, 3);
                 item.user_id = sqlite3_column_int64(stmt, 4);
-                item.created_at = sqlite3_column_int64(stmt, 5);
-                item.retry_count = sqlite3_column_int(stmt, 6);
+                item.username = (const char*)sqlite3_column_text(stmt, 5);
+                item.created_at = sqlite3_column_int64(stmt, 6);
+                item.retry_count = sqlite3_column_int(stmt, 7);
                 
                 sqlite3_finalize(stmt);
                 
@@ -214,26 +298,27 @@ public:
     }
     
     /**
-     * Mark a work item as completed and remove it from the queue
+     * Mark a work item as completed (keeps it in database for history)
      */
     bool markCompleted(int64_t item_id) {
         std::lock_guard<std::mutex> lock(queue_mutex);
         
-        const char* delete_sql = "DELETE FROM work_queue WHERE id = ?;";
+        const char* update_sql = "UPDATE work_queue SET status = 'completed', bella_end_time = ? WHERE id = ?;";
         
         sqlite3_stmt* stmt;
-        int rc = sqlite3_prepare_v2(db, delete_sql, -1, &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db, update_sql, -1, &stmt, nullptr);
         if (rc != SQLITE_OK) {
-            std::cerr << "❌ Failed to prepare delete statement: " << sqlite3_errmsg(db) << std::endl;
+            std::cerr << "❌ Failed to prepare completion update: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
         
-        sqlite3_bind_int64(stmt, 1, item_id);
+        sqlite3_bind_int64(stmt, 1, std::time(nullptr));
+        sqlite3_bind_int64(stmt, 2, item_id);
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         
         if (rc != SQLITE_DONE) {
-            std::cerr << "❌ Failed to delete completed work item: " << sqlite3_errmsg(db) << std::endl;
+            std::cerr << "❌ Failed to mark work item as completed: " << sqlite3_errmsg(db) << std::endl;
             return false;
         }
         
@@ -294,11 +379,238 @@ public:
     }
     
     /**
+     * Mark when bella starts rendering for a job
+     */
+    bool markBellaStarted(int64_t item_id) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        const char* update_sql = "UPDATE work_queue SET bella_start_time = ? WHERE id = ?;";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, update_sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "❌ Failed to prepare bella start time update: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+        
+        sqlite3_bind_int64(stmt, 1, std::time(nullptr));
+        sqlite3_bind_int64(stmt, 2, item_id);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        
+        if (rc != SQLITE_DONE) {
+            std::cerr << "❌ Failed to update bella start time: " << sqlite3_errmsg(db) << std::endl;
+            return false;
+        }
+        
+        std::cout << "⏱️ Marked bella start time for job " << item_id << std::endl;
+        return true;
+    }
+    
+    /**
+     * Get history of completed jobs for /history command
+     * Returns a vector of tuples: (original_filename, username, bella_start_time, bella_end_time, created_at)
+     */
+    std::vector<std::tuple<std::string, std::string, int64_t, int64_t, int64_t>> getHistory(int limit = 10) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        std::vector<std::tuple<std::string, std::string, int64_t, int64_t, int64_t>> result;
+        
+        const char* history_sql = R"(
+            SELECT original_filename, username, bella_start_time, bella_end_time, created_at
+            FROM work_queue 
+            WHERE status = 'completed' AND bella_start_time > 0 AND bella_end_time > 0
+            ORDER BY bella_end_time DESC
+            LIMIT ?;
+        )";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, history_sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "❌ Failed to prepare history query: " << sqlite3_errmsg(db) << std::endl;
+            return result;
+        }
+        
+        sqlite3_bind_int(stmt, 1, limit);
+        
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string filename = (const char*)sqlite3_column_text(stmt, 0);
+            std::string username = (const char*)sqlite3_column_text(stmt, 1);
+            int64_t bella_start_time = sqlite3_column_int64(stmt, 2);
+            int64_t bella_end_time = sqlite3_column_int64(stmt, 3);
+            int64_t created_at = sqlite3_column_int64(stmt, 4);
+            result.emplace_back(filename, username, bella_start_time, bella_end_time, created_at);
+        }
+        
+        sqlite3_finalize(stmt);
+        return result;
+    }
+    
+    /**
+     * Signal the current job to be cancelled
+     * Returns the filename of the job being cancelled, or empty string if none
+     */
+    std::string cancelCurrentJob() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        const char* select_sql = R"(
+            SELECT id, original_filename FROM work_queue 
+            WHERE status = 'processing'
+            ORDER BY created_at ASC
+            LIMIT 1;
+        )";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, select_sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "❌ Failed to prepare current job select: " << sqlite3_errmsg(db) << std::endl;
+            return "";
+        }
+        
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            int64_t job_id = sqlite3_column_int64(stmt, 0);
+            std::string filename = (const char*)sqlite3_column_text(stmt, 1);
+            sqlite3_finalize(stmt);
+            
+            // Signal cancellation
+            cancel_current_job = true;
+            std::cout << "🛑 Admin requested cancellation of job " << job_id << ": " << filename << std::endl;
+            return filename;
+        } else {
+            sqlite3_finalize(stmt);
+        }
+        
+        return ""; // No job found
+    }
+    
+    /**
+     * Check if the current job should be cancelled
+     */
+    bool shouldCancelCurrentJob() {
+        return cancel_current_job.load();
+    }
+    
+    /**
+     * Mark the current job as cancelled and remove it
+     */
+    void markCurrentJobCancelled() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        // Reset cancellation flag
+        cancel_current_job = false;
+        
+        // Remove the cancelled job
+        int64_t job_id = current_job_id.load();
+        if (job_id > 0) {
+            const char* delete_sql = "DELETE FROM work_queue WHERE id = ?;";
+            sqlite3_stmt* stmt;
+            int rc = sqlite3_prepare_v2(db, delete_sql, -1, &stmt, nullptr);
+            if (rc == SQLITE_OK) {
+                sqlite3_bind_int64(stmt, 1, job_id);
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+                std::cout << "🗑️ Cancelled job " << job_id << " removed from database" << std::endl;
+            }
+            current_job_id = 0;
+        }
+    }
+    
+    /**
+     * Set the current job ID being processed
+     */
+    void setCurrentJobId(int64_t job_id) {
+        current_job_id = job_id;
+    }
+    
+    /**
+     * Get the user ID of the current processing job owner
+     * Returns 0 if no job is processing
+     */
+    uint64_t getCurrentJobOwnerId() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        const char* select_sql = R"(
+            SELECT user_id FROM work_queue 
+            WHERE status = 'processing'
+            ORDER BY created_at ASC
+            LIMIT 1;
+        )";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, select_sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            return 0;
+        }
+        
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            uint64_t user_id = sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+            return user_id;
+        }
+        
+        sqlite3_finalize(stmt);
+        return 0; // No processing job found
+    }
+    
+    /**
      * Request shutdown of the work queue
      */
     void requestShutdown() {
         shutdown_requested = true;
         queue_condition.notify_all();
+    }
+    
+    /**
+     * Get all jobs for queue display (processing + pending)
+     * Returns a vector of tuples: (original_filename, username, is_processing, bella_start_time)
+     */
+    std::vector<std::tuple<std::string, std::string, bool, int64_t>> getQueueDisplay() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        std::vector<std::tuple<std::string, std::string, bool, int64_t>> result;
+        
+        // First get processing jobs (currently rendering)
+        const char* processing_sql = R"(
+            SELECT original_filename, username, bella_start_time
+            FROM work_queue 
+            WHERE status = 'processing'
+            ORDER BY created_at ASC;
+        )";
+        
+        sqlite3_stmt* stmt;
+        int rc = sqlite3_prepare_v2(db, processing_sql, -1, &stmt, nullptr);
+        if (rc == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string filename = (const char*)sqlite3_column_text(stmt, 0);
+                std::string username = (const char*)sqlite3_column_text(stmt, 1);
+                int64_t bella_start_time = sqlite3_column_int64(stmt, 2);
+                result.emplace_back(filename, username, true, bella_start_time); // true = processing
+            }
+            sqlite3_finalize(stmt);
+        }
+        
+        // Then get pending jobs
+        const char* pending_sql = R"(
+            SELECT original_filename, username
+            FROM work_queue 
+            WHERE status = 'pending'
+            ORDER BY created_at ASC;
+        )";
+        
+        rc = sqlite3_prepare_v2(db, pending_sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::cerr << "❌ Failed to prepare queue display query: " << sqlite3_errmsg(db) << std::endl;
+            return result;
+        }
+        
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string filename = (const char*)sqlite3_column_text(stmt, 0);
+            std::string username = (const char*)sqlite3_column_text(stmt, 1);
+            result.emplace_back(filename, username, false, 0); // false = pending, 0 = no bella start time
+        }
+        
+        sqlite3_finalize(stmt);
+        return result;
     }
     
 private:
@@ -379,9 +691,11 @@ std::string getHiddenInput(const std::string& prompt) {
  * @param engine - Reference to the bella engine
  * @param bsz_data - The .bsz file data as bytes
  * @param filename - The original filename
+ * @param work_queue - Reference to work queue for tracking bella start time
+ * @param item_id - ID of the work item being processed
  * @return std::vector<uint8_t> - The rendered output data
  */
-std::vector<uint8_t> processBszFile(dl::bella_sdk::Engine& engine, const std::vector<uint8_t>& bsz_data, const std::string& filename) {
+std::vector<uint8_t> processBszFile(dl::bella_sdk::Engine& engine, const std::vector<uint8_t>& bsz_data, const std::string& filename, WorkQueue* work_queue, int64_t item_id) {
     std::cout << "🔄 Processing .bsz file (" << bsz_data.size() << " bytes)..." << std::endl;
     
     // Fix locale issues that can cause Bella Engine to fail
@@ -431,11 +745,31 @@ std::vector<uint8_t> processBszFile(dl::bella_sdk::Engine& engine, const std::ve
         
         // Start rendering
         std::cout << "🎨 Starting bella render..." << std::endl;
+        
+        // Mark bella start time for queue tracking
+        if (work_queue) {
+            work_queue->markBellaStarted(item_id);
+        }
+        
         engine.start();
         
-        // Wait for rendering to complete
+        // Wait for rendering to complete, checking for cancellation
+        bool was_cancelled = false;
         while(engine.rendering()) { 
+            // Check for cancellation every 500ms
+            if (work_queue && work_queue->shouldCancelCurrentJob()) {
+                std::cout << "🛑 Cancelling bella render for job " << item_id << std::endl;
+                engine.stop(); // Stop the Bella render
+                was_cancelled = true;
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        
+        if (was_cancelled) {
+            std::cout << "🛑 Bella render cancelled successfully" << std::endl;
+            work_queue->markCurrentJobCancelled();
+            return bsz_data; // Return original data since render was cancelled
         }
         
         std::cout << "✅ Bella render completed!" << std::endl;
@@ -496,11 +830,28 @@ void workerThread(dpp::cluster* bot, WorkQueue* work_queue, dl::bella_sdk::Engin
         }
         
         if (download_success) {
+            // Set current job ID for cancellation tracking
+            work_queue->setCurrentJobId(item.id);
+            
             // Convert response body to vector for processing
             std::vector<uint8_t> original_data(download_data.begin(), download_data.end());
             
+            // Check for cancellation before processing
+            if (work_queue->shouldCancelCurrentJob()) {
+                std::cout << "🛑 Job " << item.id << " cancelled before processing" << std::endl;
+                work_queue->markCurrentJobCancelled();
+                continue;
+            }
+            
             // Process the .bsz file with bella path tracer
-            std::vector<uint8_t> processed_data = processBszFile(*engine, original_data, item.original_filename);
+            std::vector<uint8_t> processed_data = processBszFile(*engine, original_data, item.original_filename, work_queue, item.id);
+            
+            // Check if job was cancelled during processing
+            if (work_queue->shouldCancelCurrentJob()) {
+                std::cout << "🛑 Job " << item.id << " was cancelled during processing, skipping result handling" << std::endl;
+                work_queue->markCurrentJobCancelled();
+                continue; // Skip to next job
+            }
             
             // Extract base filename for the rendered JPEG
             std::string base_filename = item.original_filename;
@@ -681,6 +1032,7 @@ int DL_main(dl::Args& args) {
     // Step 7: Set up event handler for file uploads
     // Lambda function that gets called whenever a message with attachments is posted
     bot.on_message_create([&work_queue](const dpp::message_create_t& event) {
+        
         // Ignore messages sent by bots (including our own) to prevent loops
         if (event.msg.author.is_bot()) {
             return;  // Early exit - don't process bot messages
@@ -734,6 +1086,7 @@ int DL_main(dl::Args& args) {
                     item.original_filename = bsz_attachment.filename;
                     item.channel_id = event.msg.channel_id;
                     item.user_id = event.msg.author.id;
+                    item.username = event.msg.author.username;
                     item.created_at = std::time(nullptr);
                     item.retry_count = 0;
                     
@@ -749,8 +1102,8 @@ int DL_main(dl::Args& args) {
     });
 
     // Step 8: Set up slash command handler (commands that start with /)
-    // [&bot] captures the bot variable by reference so we can use it inside the lambda
-    bot.on_slashcommand([&bot](const dpp::slashcommand_t& event) {
+    // [&bot, &work_queue] captures variables by reference so we can use them inside the lambda
+    bot.on_slashcommand([&bot, &work_queue](const dpp::slashcommand_t& event) {
         // Generate unique ID for this command execution (for debugging)
         static int command_counter = 0;  // static = keeps value between function calls (like a global variable)
         int command_id = ++command_counter;  // Pre-increment: add 1 then use value (so first command = 1)
@@ -765,26 +1118,229 @@ int DL_main(dl::Args& args) {
         std::cout << "Timestamp: " << std::time(nullptr) << std::endl;  // Unix timestamp
         std::cout << "Interaction ID: " << event.command.id << std::endl;
         
-        // Check if this is the command we care about
+        // Check which command was invoked
         if (event.command.get_command_name() == "help") {
             // CRITICAL: Must acknowledge Discord interaction within 3 seconds
             // or Discord shows "The application did not respond" error
             std::cout << "Sending interaction acknowledgment for command #" << command_id << "..." << std::endl;
-            event.reply("🚀 I am a Bella render bot, ready to render your scenes!\nNo need to mention me, just upload your scene(s) (.bsz) and I will render them.");
+            // Standard help message (admin commands are discoverable but user-protected)
+            std::string help_message = "🚀 I am a Bella render bot, ready to render your scenes!\n\n**Commands:**\n• Upload .bsz files - I'll automatically render them\n• `/queue` - See current render queue\n• `/history` - View recently completed renders\n• `/remove` - Cancel current rendering job (your own jobs or admin)";
+            
+            event.reply(help_message);
             
             // Generate unique thread ID for debugging async operations
             static int thread_counter = 0;  // Separate counter for threads
             int current_thread_id = ++thread_counter;
+            
+        } else if (event.command.get_command_name() == "queue") {
+            std::cout << "Processing queue command #" << command_id << "..." << std::endl;
+            
+            // Get all jobs (processing + pending) from the work queue
+            auto queue_jobs = work_queue.getQueueDisplay();
+            
+            // Count processing and pending jobs separately
+            size_t processing_count = 0;
+            size_t pending_count = 0;
+            for (const auto& job : queue_jobs) {
+                if (std::get<2>(job)) { // is_processing
+                    processing_count++;
+                } else {
+                    pending_count++;
+                }
+            }
+            
+            if (queue_jobs.empty()) {
+                // No jobs in queue at all
+                event.reply("🎉 Congrats, there are no queued jobs, any .bsz file you send me will be processed immediately!");
+            } else {
+                // Build queue display message
+                std::string queue_message = "";
+                
+                size_t pending_position = 1;
+                
+                for (const auto& job : queue_jobs) {
+                    const std::string& filename = std::get<0>(job);
+                    const std::string& username = std::get<1>(job);
+                    bool is_processing = std::get<2>(job);
+                    int64_t bella_start_time = std::get<3>(job);
+                    
+                    if (is_processing) {
+                        std::string render_time_text = "";
+                        if (bella_start_time > 0) {
+                            int64_t elapsed_seconds = std::time(nullptr) - bella_start_time;
+                            int minutes = elapsed_seconds / 60;
+                            int seconds = elapsed_seconds % 60;
+                            
+                            if (minutes > 0) {
+                                render_time_text = " (" + std::to_string(minutes) + "m " + std::to_string(seconds) + "s)";
+                            } else {
+                                render_time_text = " (" + std::to_string(seconds) + "s)";
+                            }
+                        }
+                        
+                        queue_message += "**Rendering:** `" + filename + "` - " + username + render_time_text + "\n";
+                    } else {
+                        queue_message += std::to_string(pending_position) + ". `" + filename + "` - " + username + "\n";
+                        pending_position++;
+                    }
+                }
+                
+                //queue_message += "\n*Jobs are processed in FIFO (first-in, first-out) order.*";
+                event.reply(queue_message);
+            }
+            
+        } else if (event.command.get_command_name() == "history") {
+            std::cout << "Processing history command #" << command_id << "..." << std::endl;
+            
+            // Get recent completed jobs from the work queue
+            auto history_jobs = work_queue.getHistory(10); // Get last 10 completed jobs
+            
+            if (history_jobs.empty()) {
+                event.reply("📜 No completed renders found in history.");
+            } else {
+                std::string history_message = "📜 **Recent Completed Renders:**\n\n";
+                
+                for (const auto& job : history_jobs) {
+                    const std::string& filename = std::get<0>(job);
+                    const std::string& username = std::get<1>(job);
+                    int64_t bella_start_time = std::get<2>(job);
+                    int64_t bella_end_time = std::get<3>(job);
+                    int64_t created_at = std::get<4>(job);
+                    
+                    // Calculate render time
+                    int64_t render_seconds = bella_end_time - bella_start_time;
+                    std::string render_time_text;
+                    
+                    if (render_seconds > 0) {
+                        int minutes = render_seconds / 60;
+                        int seconds = render_seconds % 60;
+                        
+                        if (minutes > 0) {
+                            render_time_text = " ⏱️ " + std::to_string(minutes) + "m " + std::to_string(seconds) + "s";
+                        } else {
+                            render_time_text = " ⏱️ " + std::to_string(seconds) + "s";
+                        }
+                    } else {
+                        render_time_text = " ⏱️ timing data incomplete";
+                    }
+                    
+                    history_message += "`" + filename + "` - " + username + render_time_text + "\n";
+                }
+                
+                event.reply(history_message);
+            }
+            
+        } else if (event.command.get_command_name() == "remove") {
+            std::cout << "Processing remove command #" << command_id << "..." << std::endl;
+            
+            // List of admin user IDs who can cancel any job
+            const std::vector<uint64_t> ADMIN_USER_IDS = {
+                780541438022254624ULL  // harvey
+                // Add more admin user IDs here, separated by commas
+                // 123456789012345678ULL,  // another admin
+            };
+            
+            uint64_t requesting_user_id = event.command.get_issuing_user().id;
+            bool is_admin = std::find(ADMIN_USER_IDS.begin(), ADMIN_USER_IDS.end(), requesting_user_id) != ADMIN_USER_IDS.end();
+            
+            // Check if there's a current job and get its submitter
+            bool is_job_owner = false;
+            std::string current_job_filename = "";
+            
+            // Get current processing job info to check ownership
+            auto current_jobs = work_queue.getQueueDisplay();
+            for (const auto& job : current_jobs) {
+                bool is_processing = std::get<2>(job); // is_processing flag
+                if (is_processing) {
+                    current_job_filename = std::get<0>(job); // filename
+                    // We need to get the user_id from database since getQueueDisplay returns username
+                    break;
+                }
+            }
+            
+            // Get the actual user_id of the job owner from database
+            if (!current_job_filename.empty()) {
+                auto job_owner_id = work_queue.getCurrentJobOwnerId();
+                if (job_owner_id == requesting_user_id) {
+                    is_job_owner = true;
+                }
+            }
+            
+            // Allow access if user is admin OR owns the current job
+            if (!is_admin && !is_job_owner) {
+                if (current_job_filename.empty()) {
+                    event.reply("ℹ️ No job is currently being processed.");
+                } else {
+                    std::cout << "🚫 Unauthorized remove command attempt from user: " << event.command.get_issuing_user().username 
+                             << " (ID: " << requesting_user_id << ") - not admin and not job owner" << std::endl;
+                    event.reply("🚫 Access denied. You can only cancel your own jobs (or be an admin).");
+                }
+                return;
+            }
+            
+            std::string user_type = is_admin ? "admin" : "job owner";
+            std::cout << "✅ Remove command authorized for " << user_type << ": " << event.command.get_issuing_user().username << std::endl;
+            
+            // User is authorized (admin or job owner), proceed with cancellation
+            std::string cancelled_filename = work_queue.cancelCurrentJob();
+            
+            if (!cancelled_filename.empty()) {
+                event.reply("🛑 **Cancelling Bella render:** `" + cancelled_filename + "`\n\nImage interrupted before reaching target noise level.");
+            } else {
+                event.reply("ℹ️ No job is currently being processed.");
+            }
+            
         } else {
             // Handle unexpected commands (probably old cached registrations)
             std::cout << "Status: UNEXPECTED COMMAND (probably cached registration) - Command #" << command_id << std::endl;
             std::cout << "========================" << std::endl;
-            event.reply("⚠️ This command is no longer supported. Please use `/help` instead.");
+            event.reply("⚠️ This command is no longer supported. Please use `/help`, `/queue`, `/history`, or `/remove`.");
         }
     });
 
+    // Helper function to register all slash commands
+    auto register_all_commands = [&bot]() {
+        std::cout << "Registering commands..." << std::endl;
+        
+        // Register help command
+        bot.global_command_create(dpp::slashcommand("help", "Show information about available commands", bot.me.id), [](const dpp::confirmation_callback_t& reg_callback) {
+            if (reg_callback.is_error()) {
+                std::cout << "❌ Failed to register help command: " << reg_callback.get_error().message << std::endl;
+            } else {
+                std::cout << "✅ Help command registered successfully!" << std::endl;
+            }
+        });
+        
+        // Register queue command
+        bot.global_command_create(dpp::slashcommand("queue", "Show current render queue status", bot.me.id), [](const dpp::confirmation_callback_t& reg_callback) {
+            if (reg_callback.is_error()) {
+                std::cout << "❌ Failed to register queue command: " << reg_callback.get_error().message << std::endl;
+            } else {
+                std::cout << "✅ Queue command registered successfully!" << std::endl;
+            }
+        });
+        
+        // Register history command
+        bot.global_command_create(dpp::slashcommand("history", "Show recently completed renders with timing", bot.me.id), [](const dpp::confirmation_callback_t& reg_callback) {
+            if (reg_callback.is_error()) {
+                std::cout << "❌ Failed to register history command: " << reg_callback.get_error().message << std::endl;
+            } else {
+                std::cout << "✅ History command registered successfully!" << std::endl;
+            }
+        });
+        
+        // Register admin remove command
+        bot.global_command_create(dpp::slashcommand("remove", "Cancel current processing job (admin or job owner)", bot.me.id), [](const dpp::confirmation_callback_t& reg_callback) {
+            if (reg_callback.is_error()) {
+                std::cout << "❌ Failed to register remove command: " << reg_callback.get_error().message << std::endl;
+            } else {
+                std::cout << "✅ Remove command registered successfully!" << std::endl;
+            }
+        });
+    };
+
     // Step 9: Set up bot ready event (called when bot successfully connects to Discord)
-    bot.on_ready([&bot](const dpp::ready_t& event) {
+    bot.on_ready([&bot, register_all_commands](const dpp::ready_t& event) {
         // run_once ensures this only happens on first connection, not reconnections
 	    if (dpp::run_once<struct register_bot_commands>()) {
 	        std::cout << "Bot is ready! Starting command registration..." << std::endl;
@@ -792,37 +1348,50 @@ int DL_main(dl::Args& args) {
 	        
 	        // Clean up any old slash commands before registering new ones
 	        std::cout << "Clearing old global commands..." << std::endl;
-	        bot.global_commands_get([&bot](const dpp::confirmation_callback_t& callback) {
+	        bot.global_commands_get([&bot, &register_all_commands](const dpp::confirmation_callback_t& callback) {
 	            if (!callback.is_error()) {
 	                // Get list of existing commands
 	                auto commands = std::get<dpp::slashcommand_map>(callback.value);
 	                std::cout << "Found " << commands.size() << " existing commands" << std::endl;
 	                
-	                // Delete each old command
-	                for (auto& command : commands) {
-	                    std::cout << "Deleting old command: " << command.second.name << std::endl;
-	                    bot.global_command_delete(command.first, [](const dpp::confirmation_callback_t& del_callback) {
-	                        if (del_callback.is_error()) {
-	                            std::cout << "❌ Failed to delete command: " << del_callback.get_error().message << std::endl;
-	                        } else {
-	                            std::cout << "✅ Command deleted successfully" << std::endl;
-	                        }
-	                    });
+	                if (commands.empty()) {
+	                    // No commands to delete, proceed directly to registration
+	                    std::cout << "No existing commands to delete, proceeding to registration..." << std::endl;
+	                    register_all_commands();
+	                } else {
+	                    // Delete each old command and count completions
+	                    auto* deletion_counter = new std::atomic<int>(0);
+	                    auto* total_commands = new int(commands.size());
+	                    
+	                    for (auto& command : commands) {
+	                        std::cout << "Deleting old command: " << command.second.name << std::endl;
+	                        bot.global_command_delete(command.first, [&bot, &register_all_commands, deletion_counter, total_commands](const dpp::confirmation_callback_t& del_callback) {
+	                            if (del_callback.is_error()) {
+	                                std::cout << "❌ Failed to delete command: " << del_callback.get_error().message << std::endl;
+	                            } else {
+	                                std::cout << "✅ Command deleted successfully" << std::endl;
+	                            }
+	                            
+	                            // Check if all deletions are complete
+	                            int completed = deletion_counter->fetch_add(1) + 1;
+	                            if (completed >= *total_commands) {
+	                                std::cout << "All " << *total_commands << " commands deleted. Starting registration..." << std::endl;
+	                                
+	                                // Register new commands after all deletions complete
+	                                register_all_commands();
+	                                
+	                                // Clean up allocated memory
+	                                delete deletion_counter;
+	                                delete total_commands;
+	                            }
+	                        });
+	                    }
 	                }
 	            } else {
 	                std::cout << "❌ Failed to get existing commands: " << callback.get_error().message << std::endl;
+	                // Still register commands even if we couldn't get existing ones
+	                register_all_commands();
 	            }
-	            
-	            // Register our new slash command
-	            std::cout << "Registering commands..." << std::endl;
-	            // Parameters: command_name, description, bot_id
-	            bot.global_command_create(dpp::slashcommand("help", "on other commands", bot.me.id), [](const dpp::confirmation_callback_t& reg_callback) {
-	                if (reg_callback.is_error()) {
-	                    std::cout << "❌ Failed to register command: " << reg_callback.get_error().message << std::endl;
-	                } else {
-	                    std::cout << "✅ Command registered successfully!" << std::endl;
-	                }
-	            });
 	        });
 	    }
     });
