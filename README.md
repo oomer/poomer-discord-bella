@@ -15,6 +15,8 @@ Prototype c++ Discord bot, that renders Bella scene files (.bsz)
 - `/queue` - See current render queue
 - `/history` - View recently completed renders
 - `/remove` - Cancel current rendering job (your own jobs or admin)
+- `/resolution=100x800` - Override the scene resolution
+- `/orbit=30` - Render camera orbit, returns .mp4 
 
 ----
 ### Technical details
@@ -25,6 +27,7 @@ Prototype c++ Discord bot, that renders Bella scene files (.bsz)
 - hardcodes outputDir and format to jpeg
 - maintains scene resolution
 - uses oom Bella utility lib
+- uses ffmpeg to compile mp4
 
 ## Build
 
@@ -33,7 +36,7 @@ Prototype c++ Discord bot, that renders Bella scene files (.bsz)
 ```
 sudo apt update
 sudo apt upgrade -y
-sudo apt install build-essential curl git cmake zlib1g-dev libssl-dev -y
+sudo apt install build-essential curl git cmake zlib1g-dev libssl-dev ffmpeg -y
 sudo apt install libsqlite3-dev -y
 mkdir workdir
 cd workdir
@@ -72,6 +75,8 @@ brew install openssl
 git clone https://github.com/brainboxdotcc/DPP.git
 cd DPP
 /Applications/CMake.app/Contents/bin/cmake -B ./build \
+  -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
   -DOPENSSL_ROOT_DIR=../homebrew/opt/openssl@3 \
   -DOPENSSL_INCLUDE_DIR=../homebrew/opt/openssl@3/include \
   -DOPENSSL_CRYPTO_LIBRARY=../homebrew/opt/openssl@3/lib/libcrypto.a \
