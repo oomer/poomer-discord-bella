@@ -12,6 +12,7 @@
 #include <unistd.h> // Unix standard definitions - provides STDIN_FILENO constant
 #include <ctime> // Time functions - for std::time() to generate timestamps
 #include <cstdlib> // C standard library - for setenv function
+#include <cstdio> // C standard I/O - for snprintf function
 #include <vector> // Dynamic arrays - for std::vector to hold image byte data
 #include <chrono> // Time utilities - for std::chrono::seconds() delays
 #include <algorithm> // Algorithm functions - for std::transform (string case conversion)
@@ -41,6 +42,7 @@ struct WorkItem {
     uint64_t channel_id;           // Discord channel ID for response
     uint64_t user_id;              // Discord user ID for mentions
     std::string username;          // Discord username for display
+    std::string message_content;   // Discord message content for orbit/resolution parsing
     int64_t created_at;            // Unix timestamp when job was created
     int retry_count;               // Number of times this job has been retried
     
@@ -95,7 +97,8 @@ public:
                 status TEXT DEFAULT 'pending',
                 bella_start_time INTEGER DEFAULT 0,
                 bella_end_time INTEGER DEFAULT 0,
-                username TEXT DEFAULT ''
+                username TEXT DEFAULT '',
+                message_content TEXT DEFAULT ''
             );
             
             CREATE INDEX IF NOT EXISTS idx_status_created 
@@ -117,6 +120,7 @@ public:
         bool has_bella_start_time = false;
         bool has_bella_end_time = false;
         bool has_username = false;
+        bool has_message_content = false;
         
         sqlite3_stmt* pragma_stmt;
         rc = sqlite3_prepare_v2(db, check_column_sql, -1, &pragma_stmt, nullptr);
@@ -130,6 +134,8 @@ public:
                         has_bella_end_time = true;
                     } else if (strcmp(column_name, "username") == 0) {
                         has_username = true;
+                    } else if (strcmp(column_name, "message_content") == 0) {
+                        has_message_content = true;
                     }
                 }
             }
@@ -172,6 +178,18 @@ public:
             }
         }
         
+        if (!has_message_content) {
+            std::cout << "🔄 Migrating database: Adding message_content column..." << std::endl;
+            const char* add_message_content_column_sql = "ALTER TABLE work_queue ADD COLUMN message_content TEXT DEFAULT '';";
+            rc = sqlite3_exec(db, add_message_content_column_sql, nullptr, nullptr, &error_msg);
+            if (rc != SQLITE_OK) {
+                std::cerr << "❌ Failed to add message_content column: " << error_msg << std::endl;
+                sqlite3_free(error_msg);
+            } else {
+                std::cout << "✅ Database migration: message_content column added" << std::endl;
+            }
+        }
+        
         // Reset any stuck 'processing' jobs back to 'pending' on startup
         // This handles cases where the bot was stopped while jobs were being processed
         const char* reset_processing_sql = "UPDATE work_queue SET status = 'pending' WHERE status = 'processing';";
@@ -203,8 +221,8 @@ public:
         
         const char* insert_sql = R"(
             INSERT INTO work_queue 
-            (attachment_url, original_filename, channel_id, user_id, username, created_at, retry_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+            (attachment_url, original_filename, channel_id, user_id, username, message_content, created_at, retry_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         )";
         
         sqlite3_stmt* stmt;
@@ -220,8 +238,9 @@ public:
         sqlite3_bind_int64(stmt, 3, item.channel_id);
         sqlite3_bind_int64(stmt, 4, item.user_id);
         sqlite3_bind_text(stmt, 5, item.username.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 6, item.created_at);
-        sqlite3_bind_int(stmt, 7, item.retry_count);
+        sqlite3_bind_text(stmt, 6, item.message_content.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 7, item.created_at);
+        sqlite3_bind_int(stmt, 8, item.retry_count);
         
         rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -247,7 +266,7 @@ public:
         
         while (!shutdown_requested) {
             const char* select_sql = R"(
-                SELECT id, attachment_url, original_filename, channel_id, user_id, username, created_at, retry_count
+                SELECT id, attachment_url, original_filename, channel_id, user_id, username, message_content, created_at, retry_count
                 FROM work_queue 
                 WHERE status = 'pending'
                 ORDER BY created_at ASC
@@ -270,8 +289,9 @@ public:
                 item.channel_id = sqlite3_column_int64(stmt, 3);
                 item.user_id = sqlite3_column_int64(stmt, 4);
                 item.username = (const char*)sqlite3_column_text(stmt, 5);
-                item.created_at = sqlite3_column_int64(stmt, 6);
-                item.retry_count = sqlite3_column_int(stmt, 7);
+                item.message_content = (const char*)sqlite3_column_text(stmt, 6);
+                item.created_at = sqlite3_column_int64(stmt, 7);
+                item.retry_count = sqlite3_column_int(stmt, 8);
                 
                 sqlite3_finalize(stmt);
                 
@@ -686,16 +706,136 @@ std::string getHiddenInput(const std::string& prompt) {
 }
 
 /**
+ * Function to parse resolution from Discord message content
+ * Supports format like "resolution=100x100" or "resolution=1920x1080"
+ * 
+ * @param message_content - The Discord message content
+ * @param width - Reference to store parsed width (0 if not found)
+ * @param height - Reference to store parsed height (0 if not found)
+ * @return bool - True if resolution was successfully parsed
+ */
+bool parseResolution(const std::string& message_content, int& width, int& height) {
+    width = 0;
+    height = 0;
+    
+    // Look for "resolution=" pattern (case insensitive)
+    std::string content_lower = message_content;
+    std::transform(content_lower.begin(), content_lower.end(), content_lower.begin(), ::tolower);
+    
+    size_t pos = content_lower.find("resolution=");
+    if (pos == std::string::npos) {
+        return false; // Pattern not found
+    }
+    
+    // Extract the resolution part after "resolution="
+    size_t start = pos + 11; // Length of "resolution="
+    if (start >= message_content.length()) {
+        return false; // Nothing after "resolution="
+    }
+    
+    // Find the end of the resolution specification (space, newline, or end of string)
+    size_t end = message_content.find_first_of(" \t\n\r", start);
+    if (end == std::string::npos) {
+        end = message_content.length();
+    }
+    
+    std::string resolution_str = message_content.substr(start, end - start);
+    
+    // Parse "WIDTHxHEIGHT" format
+    size_t x_pos = resolution_str.find('x');
+    if (x_pos == std::string::npos) {
+        x_pos = resolution_str.find('X'); // Try uppercase X
+    }
+    
+    if (x_pos == std::string::npos || x_pos == 0 || x_pos == resolution_str.length() - 1) {
+        return false; // No 'x' found or 'x' at beginning/end
+    }
+    
+    try {
+        std::string width_str = resolution_str.substr(0, x_pos);
+        std::string height_str = resolution_str.substr(x_pos + 1);
+        
+        width = std::stoi(width_str);
+        height = std::stoi(height_str);
+        
+        // Validate reasonable resolution bounds
+        if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+            std::cout << "⚠️ Invalid resolution values: " << width << "x" << height << " (must be 1-8192)" << std::endl;
+            width = 0;
+            height = 0;
+            return false;
+        }
+        
+        std::cout << "✅ Parsed resolution override: " << width << "x" << height << std::endl;
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cout << "⚠️ Failed to parse resolution numbers: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+/**
+ * Function to parse orbit from Discord message content
+ * Supports format like "orbit=10" for 10 frames
+ * 
+ * @param message_content - The Discord message content
+ * @return int - Number of frames to render (0 if not found)
+ */
+int parseOrbit(const std::string& message_content) {
+    // Look for "orbit=" pattern (case insensitive)
+    std::string content_lower = message_content;
+    std::transform(content_lower.begin(), content_lower.end(), content_lower.begin(), ::tolower);
+    
+    size_t pos = content_lower.find("orbit=");
+    if (pos == std::string::npos) {
+        return 0; // Pattern not found
+    }
+    
+    // Extract the number part after "orbit="
+    size_t start = pos + 6; // Length of "orbit="
+    if (start >= message_content.length()) {
+        return 0; // Nothing after "orbit="
+    }
+    
+    // Find the end of the number specification (space, newline, or end of string)
+    size_t end = message_content.find_first_of(" \t\n\r", start);
+    if (end == std::string::npos) {
+        end = message_content.length();
+    }
+    
+    std::string frames_str = message_content.substr(start, end - start);
+    
+    try {
+        int frames = std::stoi(frames_str);
+        
+        // Validate reasonable frame count bounds
+        if (frames <= 0 || frames > 300) {
+            std::cout << "⚠️ Invalid orbit frame count: " << frames << " (must be 1-300)" << std::endl;
+            return 0;
+        }
+        
+        std::cout << "✅ Parsed orbit frames: " << frames << std::endl;
+        return frames;
+        
+    } catch (const std::exception& e) {
+        std::cout << "⚠️ Failed to parse orbit frame count: " << e.what() << std::endl;
+        return 0;
+    }
+}
+
+/**
  * Function to process .bsz file with bella path tracer
  * 
  * @param engine - Reference to the bella engine
  * @param bsz_data - The .bsz file data as bytes
  * @param filename - The original filename
+ * @param message_content - The Discord message content for orbit parsing
  * @param work_queue - Reference to work queue for tracking bella start time
  * @param item_id - ID of the work item being processed
- * @return std::vector<uint8_t> - The rendered output data
+ * @return std::string - The output filename (JPEG or MP4)
  */
-std::vector<uint8_t> processBszFile(dl::bella_sdk::Engine& engine, const std::vector<uint8_t>& bsz_data, const std::string& filename, WorkQueue* work_queue, int64_t item_id) {
+std::string processBszFile(dl::bella_sdk::Engine& engine, const std::vector<uint8_t>& bsz_data, const std::string& filename, const std::string& message_content, WorkQueue* work_queue, int64_t item_id) {
     std::cout << "🔄 Processing .bsz file (" << bsz_data.size() << " bytes)..." << std::endl;
     
     // Fix locale issues that can cause Bella Engine to fail
@@ -739,48 +879,135 @@ std::vector<uint8_t> processBszFile(dl::bella_sdk::Engine& engine, const std::ve
         belScene.beautyPass()["overridePath"] = imgOutputPath;
         auto belCamera = belScene.camera();
         auto belCameraPath = belScene.cameraPath(); // Since camera can be instanced, we get the full path of th one currently define din scene settings
-        //belCamera["resolution"] = dl::Vec2{200, 200}; 
+        
+        // Check for orbit animation
+        int orbit_frames = parseOrbit(message_content);
+        
+        // Check for resolution override (applies to both single frame and orbit)
+        int override_width, override_height;
+        bool has_resolution_override = parseResolution(message_content, override_width, override_height);
         
         std::cout << "✅ Loaded .bsz scene into bella engine" << std::endl;
-        
-        // Start rendering
-        std::cout << "🎨 Starting bella render..." << std::endl;
         
         // Mark bella start time for queue tracking
         if (work_queue) {
             work_queue->markBellaStarted(item_id);
         }
         
-        engine.start();
-        
-        // Wait for rendering to complete, checking for cancellation
-        bool was_cancelled = false;
-        while(engine.rendering()) { 
-            // Check for cancellation every 500ms
-            if (work_queue && work_queue->shouldCancelCurrentJob()) {
-                std::cout << "🛑 Cancelling bella render for job " << item_id << std::endl;
-                engine.stop(); // Stop the Bella render
-                was_cancelled = true;
-                break;
+        if (orbit_frames > 0) {
+            // Orbit camera animation rendering
+            std::cout << "🎨 Starting orbit animation with " << orbit_frames << " frames..." << std::endl;
+            
+            // Set resolution for orbit rendering
+            if (has_resolution_override) {
+                std::cout << "🖼️ Applying resolution override for orbit: " << override_width << "x" << override_height << std::endl;
+                belCamera["resolution"] = dl::Vec2{override_width, override_height};
+            } else {
+                std::cout << "🖼️ Using default orbit resolution: 100x100" << std::endl;
+                //belCamera["resolution"] = dl::Vec2{100, 100}; // Default smaller for faster processing
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            
+            for (int i = 0; i < orbit_frames; i++) {
+                // Check for cancellation before each frame
+                if (work_queue && work_queue->shouldCancelCurrentJob()) {
+                    std::cout << "🛑 Cancelling orbit render for job " << item_id << " at frame " << i << std::endl;
+                    work_queue->markCurrentJobCancelled();
+                    return ""; // Return empty string for cancelled job
+                }
+                
+                std::cout << "📹 Rendering frame " << (i + 1) << "/" << orbit_frames << std::endl;
+                
+                // Apply orbit offset for this frame
+                auto offset = dl::Vec2{i * 0.25, 0.0};
+                dl::bella_sdk::orbitCamera(engine.scene().cameraPath(), offset);
+                
+                // Set output filename for this frame
+                auto belBeautyPass = belScene.beautyPass();
+                belBeautyPass["outputName"] = dl::String::format("frame_%04d", i);
+                
+                // Render this frame
+                engine.start();
+                while(engine.rendering()) { 
+                    // Check for cancellation during frame rendering
+                    if (work_queue && work_queue->shouldCancelCurrentJob()) {
+                        std::cout << "🛑 Cancelling orbit render during frame " << (i + 1) << std::endl;
+                        engine.stop();
+                        work_queue->markCurrentJobCancelled();
+                        return ""; // Return empty string for cancelled job
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+                
+                std::cout << "✅ Frame " << (i + 1) << " completed" << std::endl;
+            }
+            
+            std::cout << "🎬 All frames rendered, creating MP4 with ffmpeg..." << std::endl;
+            
+            // Create MP4 using ffmpeg
+            std::string output_mp4 = base_filename + ".mp4";
+            std::string command = "ffmpeg -y -loglevel error -framerate 30 -i frame_%04d.jpg -c:v libx264 -pix_fmt yuv420p " + output_mp4;
+            
+            std::cout << "Executing FFmpeg command: " << command << std::endl;
+            int result = std::system(command.c_str());
+            
+            if (result == 0) {
+                std::cout << "✅ MP4 conversion successful: " << output_mp4 << std::endl;
+                
+                // Clean up individual frame files
+                for (int i = 0; i < orbit_frames; i++) {
+                    char frame_file[32];
+                    snprintf(frame_file, sizeof(frame_file), "frame_%04d.jpg", i);
+                    std::remove(frame_file);
+                }
+                std::cout << "🧹 Cleaned up individual frame files" << std::endl;
+                
+                return output_mp4;
+            } else {
+                std::cout << "❌ FFmpeg conversion failed with error code: " << result << std::endl;
+                return ""; // Return empty string for failed conversion
+            }
+            
+        } else {
+            // Single frame rendering
+            std::cout << "🎨 Starting single frame bella render..." << std::endl;
+            
+            // Apply resolution override for single frame if specified
+            if (has_resolution_override) {
+                std::cout << "🖼️ Applying resolution override: " << override_width << "x" << override_height << std::endl;
+                belCamera["resolution"] = dl::Vec2{override_width, override_height};
+            } else {
+                std::cout << "🖼️ Using scene's default resolution (no override specified)" << std::endl;
+                // Keep the scene's original resolution - no change needed
+            }
+            
+            engine.start();
+            
+            // Wait for rendering to complete, checking for cancellation
+            bool was_cancelled = false;
+            while(engine.rendering()) { 
+                // Check for cancellation every 500ms
+                if (work_queue && work_queue->shouldCancelCurrentJob()) {
+                    std::cout << "🛑 Cancelling bella render for job " << item_id << std::endl;
+                    engine.stop(); // Stop the Bella render
+                    was_cancelled = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            
+            if (was_cancelled) {
+                std::cout << "🛑 Bella render cancelled successfully" << std::endl;
+                work_queue->markCurrentJobCancelled();
+                return ""; // Return empty string for cancelled job
+            }
+            
+            std::cout << "✅ Single frame render completed!" << std::endl;
+            return base_filename + ".jpg";
         }
-        
-        if (was_cancelled) {
-            std::cout << "🛑 Bella render cancelled successfully" << std::endl;
-            work_queue->markCurrentJobCancelled();
-            return bsz_data; // Return original data since render was cancelled
-        }
-        
-        std::cout << "✅ Bella render completed!" << std::endl;
-        
-        // TODO: Read the rendered output and return it
-        // For now, return original data as placeholder
-        return bsz_data;
         
     } catch (const std::exception& e) {
         std::cerr << "❌ Error processing .bsz file: " << e.what() << std::endl;
-        return bsz_data;
+        return ""; // Return empty string for error
     }
 }
 
@@ -844,47 +1071,48 @@ void workerThread(dpp::cluster* bot, WorkQueue* work_queue, dl::bella_sdk::Engin
             }
             
             // Process the .bsz file with bella path tracer
-            std::vector<uint8_t> processed_data = processBszFile(*engine, original_data, item.original_filename, work_queue, item.id);
+            std::string output_filename = processBszFile(*engine, original_data, item.original_filename, item.message_content, work_queue, item.id);
             
             // Check if job was cancelled during processing
-            if (work_queue->shouldCancelCurrentJob()) {
-                std::cout << "🛑 Job " << item.id << " was cancelled during processing, skipping result handling" << std::endl;
-                work_queue->markCurrentJobCancelled();
+            if (work_queue->shouldCancelCurrentJob() || output_filename.empty()) {
+                std::cout << "🛑 Job " << item.id << " was cancelled or failed during processing, skipping result handling" << std::endl;
+                if (work_queue->shouldCancelCurrentJob()) {
+                    work_queue->markCurrentJobCancelled();
+                }
                 continue; // Skip to next job
             }
             
-            // Extract base filename for the rendered JPEG
-            std::string base_filename = item.original_filename;
-            if (base_filename.length() >= 4 && base_filename.substr(base_filename.length() - 4) == ".bsz") {
-                base_filename = base_filename.substr(0, base_filename.length() - 4);
-            }
-            std::string jpeg_filename = base_filename + ".jpg";
-            
             // Variables for message creation
-            std::vector<uint8_t> jpeg_data;
+            std::vector<uint8_t> file_data;
             dpp::message msg(item.channel_id, "");
             
-            // Read the rendered JPEG file from disk
-            std::ifstream jpeg_file(jpeg_filename, std::ios::binary);
+            // Read the output file from disk (JPEG or MP4)
+            std::ifstream output_file(output_filename, std::ios::binary);
             
-            if (jpeg_file.is_open()) {
+            if (output_file.is_open()) {
                 // Get file size
-                jpeg_file.seekg(0, std::ios::end);
-                size_t file_size = jpeg_file.tellg();
-                jpeg_file.seekg(0, std::ios::beg);
+                output_file.seekg(0, std::ios::end);
+                size_t file_size = output_file.tellg();
+                output_file.seekg(0, std::ios::beg);
                 
-                // Read JPEG data
-                jpeg_data.resize(file_size);
-                jpeg_file.read(reinterpret_cast<char*>(jpeg_data.data()), file_size);
-                jpeg_file.close();
+                // Read file data
+                file_data.resize(file_size);
+                output_file.read(reinterpret_cast<char*>(file_data.data()), file_size);
+                output_file.close();
                 
-                std::cout << "📷 Read rendered JPEG: " << jpeg_filename << " (" << jpeg_data.size() << " bytes)" << std::endl;
+                std::cout << "📁 Read output file: " << output_filename << " (" << file_data.size() << " bytes)" << std::endl;
                 
-                // Create message with rendered JPEG
-                msg.content = "🎨 Here's your rendered image! <@" + std::to_string(item.user_id) + ">";
-                msg.add_file(jpeg_filename, std::string(jpeg_data.begin(), jpeg_data.end()));
+                // Check if it's an MP4 (orbit animation) or JPEG (single frame)
+                bool is_mp4 = (output_filename.length() >= 4 && output_filename.substr(output_filename.length() - 4) == ".mp4");
+                
+                if (is_mp4) {
+                    msg.content = "🎬 Here's your orbit animation! <@" + std::to_string(item.user_id) + ">";
+                } else {
+                    msg.content = "🎨 Here's your rendered image! <@" + std::to_string(item.user_id) + ">";
+                }
+                msg.add_file(output_filename, std::string(file_data.begin(), file_data.end()));
             } else {
-                std::cout << "❌ Could not read rendered JPEG file: " << jpeg_filename << std::endl;
+                std::cout << "❌ Could not read output file: " << output_filename << std::endl;
                 // Fallback: send error message
                 msg.content = "❌ Rendering completed but could not read output file. <@" + std::to_string(item.user_id) + ">";
             }
@@ -902,10 +1130,10 @@ void workerThread(dpp::cluster* bot, WorkQueue* work_queue, dl::bella_sdk::Engin
                     std::cout << "❌ Failed to send message: " << callback.get_error().message << std::endl;
                     send_success = false;
                 } else {
-                    if (jpeg_data.empty()) {
+                    if (file_data.empty()) {
                         std::cout << "✅ Successfully sent error message for " << item.original_filename << std::endl;
                     } else {
-                        std::cout << "✅ Successfully sent rendered " << jpeg_filename << "!" << std::endl;
+                        std::cout << "✅ Successfully sent " << output_filename << "!" << std::endl;
                     }
                     send_success = true;
                 }
@@ -920,7 +1148,7 @@ void workerThread(dpp::cluster* bot, WorkQueue* work_queue, dl::bella_sdk::Engin
                 send_cv.wait(lock, [&]{ return send_complete; });
             }
             
-            if (send_success && !jpeg_data.empty()) {
+            if (send_success && !file_data.empty()) {
                 work_queue->markCompleted(item.id);
             } else {
                 work_queue->markFailed(item.id);
@@ -1087,6 +1315,7 @@ int DL_main(dl::Args& args) {
                     item.channel_id = event.msg.channel_id;
                     item.user_id = event.msg.author.id;
                     item.username = event.msg.author.username;
+                    item.message_content = event.msg.content; // Store message content for orbit parsing
                     item.created_at = std::time(nullptr);
                     item.retry_count = 0;
                     
@@ -1414,4 +1643,4 @@ int DL_main(dl::Args& args) {
     
     // This line should never be reached unless the bot shuts down
     return 0;
-}       
+}
